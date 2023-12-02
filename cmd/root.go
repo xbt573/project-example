@@ -1,44 +1,51 @@
 package cmd
 
 import (
+	"github.com/go-playground/validator/v10"
+	jwtware "github.com/gofiber/contrib/jwt"
+	"github.com/gofiber/fiber/v2"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
-	"github.com/xbt573/project-example/api"
+	"github.com/xbt573/project-example/controllers"
 	"github.com/xbt573/project-example/database"
 	"github.com/xbt573/project-example/services"
 	"log/slog"
 	"os"
 )
 
-var (
-	config string
-)
-
 func init() {
-	rootCmd.PersistentFlags().StringVar(&config, "config", "", "Config file location")
-	rootCmd.PersistentFlags().String("listen_url", "localhost:3000", "host:port for http server to listen on")
+	rootCmd.PersistentFlags().String("config", "", "Config location")
 	rootCmd.PersistentFlags().String("database_url", "", "PostgreSQL database url")
+	rootCmd.PersistentFlags().String("listen_url", "", "host:port to listen on")
+	rootCmd.PersistentFlags().String("secret", "", "JWT signing secret")
 
-	viper.BindEnv("listen_url", "LISTEN_URL")
+	viper.BindEnv("config", "CONFIG")
 	viper.BindEnv("database_url", "DATABASE_URL")
+	viper.BindEnv("listen_url", "LISTEN_URL")
+	viper.BindEnv("secret", "JWT_SECRET")
 
-	viper.BindPFlag("listen_url", rootCmd.PersistentFlags().Lookup("listen_url"))
+	viper.BindPFlag("config", rootCmd.PersistentFlags().Lookup("config"))
 	viper.BindPFlag("database_url", rootCmd.PersistentFlags().Lookup("database_url"))
+	viper.BindPFlag("listen_url", rootCmd.PersistentFlags().Lookup("listen_url"))
+	viper.BindPFlag("secret", rootCmd.PersistentFlags().Lookup("secret"))
+
+	viper.SetDefault("listen_url", "localhost:3000")
+	viper.SetDefault("secret", "asdihuiqhfqif")
+
+	viper.SetConfigName("config")
+	viper.SetConfigType("yaml")
+	viper.AddConfigPath(".")
+	viper.AddConfigPath("$XDG_CONFIG_HOME/project-example")
+	viper.AddConfigPath("$HOME/.config/project-example")
+	viper.AddConfigPath("/etc/project-example/")
 
 	cobra.OnInitialize(func() {
-		viper.SetConfigName("config")
-		viper.SetConfigType("yaml")
-		viper.AddConfigPath(".")
-		viper.AddConfigPath("/etc/project-example")
-		viper.AddConfigPath("$XDG_CONFIG_HOME/project-example")
-		viper.AddConfigPath("$HOME/.config/project-example")
-
-		if config != "" {
+		if config := viper.GetString("config"); config != "" {
 			viper.SetConfigFile(config)
 		}
 
-		err := viper.ReadInConfig()
-		if err != nil {
+		if err := viper.ReadInConfig(); err != nil {
 			if _, ok := err.(viper.ConfigFileNotFoundError); ok {
 				return
 			}
@@ -51,37 +58,67 @@ func init() {
 
 var rootCmd = &cobra.Command{
 	Use:   "project-example",
-	Short: "project-example is a simple todo service",
+	Short: "service example",
 	Run: func(cmd *cobra.Command, args []string) {
 		var (
-			listenUrl   = viper.GetString("listen_url")
 			databaseUrl = viper.GetString("database_url")
+			listenUrl   = viper.GetString("listen_url")
+			secret      = viper.GetString("secret")
 		)
 
 		if databaseUrl == "" {
-			slog.Error("Invalid database url!")
+			slog.Error("database_url cannot be empty!")
 			os.Exit(1)
 		}
 
-		err := database.InitDatabase(databaseUrl)
+		slog.Info("Starting project-example")
+
+		db, err := database.NewDB(databaseUrl, nil)
 		if err != nil {
 			slog.Error("Failed to init db!", slog.String("err", err.Error()))
-			os.Exit(1)
 		}
 
-		services.InitTodoService(database.GetInstance())
+		todoService := services.NewTodoService(db)
+		userService := services.NewUserService(db, secret)
+		validatorObj := validator.New(validator.WithRequiredStructEnabled())
 
-		server := api.NewAPI()
-		if err := server.Listen(listenUrl); err != nil {
-			slog.Error("Failed serving!", slog.String("err", err.Error()))
-			os.Exit(1)
+		todoController := controllers.NewTodoController(todoService, validatorObj)
+		userController := controllers.NewUserController(userService, validatorObj)
+
+		app := fiber.New(fiber.Config{
+			DisableStartupMessage: true,
+		})
+		jwtAccessMiddleware := jwtware.New(jwtware.Config{
+			SigningKey: jwtware.SigningKey{Key: []byte(secret)},
+			Claims:     jwt.MapClaims{"subject": "access_token"},
+		})
+
+		jwtRefreshMiddleware := jwtware.New(jwtware.Config{
+			SigningKey: jwtware.SigningKey{Key: []byte(secret)},
+			Claims:     jwt.MapClaims{"subject": "refresh_token"},
+		})
+
+		app.Route("/api/v1", func(router fiber.Router) {
+			router.Post("/register", userController.Register)
+			router.Post("/login", userController.Login)
+			router.Get("/refresh", jwtRefreshMiddleware, userController.Refresh)
+
+			router.Route("tasks", func(router fiber.Router) {
+				router.Get("/", jwtAccessMiddleware, todoController.List)
+				router.Get("/:id", jwtAccessMiddleware, todoController.Find)
+				router.Post("/", jwtAccessMiddleware, todoController.Create)
+				router.Patch("/", jwtAccessMiddleware, todoController.Update)
+				router.Delete("/:id", jwtAccessMiddleware, todoController.Delete)
+			})
+		})
+
+		slog.Info("Started listening", slog.String("listen_url", listenUrl))
+		if err := app.Listen(listenUrl); err != nil {
+			slog.Error("Failed to listen!", slog.String("err", err.Error()))
 		}
 	},
 }
 
-func Execute() {
-	if err := rootCmd.Execute(); err != nil {
-		slog.Error("Failed to start cmd!", slog.String("err", err.Error()))
-		os.Exit(1)
-	}
+func Execute() error {
+	return rootCmd.Execute()
 }

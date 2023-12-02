@@ -2,7 +2,8 @@ package models
 
 type TODO struct {
 	ID          uint   `gorm:"primaryKey" json:"id,omitempty"`
-	Name        string `json:"name"`
+	UserID      uint   `json:"-"`
+	Name        string `json:"name" validate:"required"`
 	Description string `json:"description,omitempty"`
-	Finished    bool   `json:"finished,omitempty"`
+	Finished    bool   `json:"finished"`
 }
